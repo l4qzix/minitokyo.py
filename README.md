@@ -175,6 +175,31 @@ image = mt.get(510114)
 
 ---
 
+### `mt.download_bytes(image_id: int, referer: str = "http://www.minitokyo.net/") -> bytes`
+
+画像IDだけを指定して、オリジナル画像のバイト列を直接取得します。Minitokyo自身の「ダウンロード」ボタンが使っているリダイレクトエンドポイント `http://www.minitokyo.net/download/{id}` を叩くため、HTMLの`/downloads/`リンクをスクレイピングする方式に一切依存しません。
+
+**これが画像を取得する最も確実な方法です。** 理由は[注意点・既知の制約](#注意点既知の制約)を参照してください（要約すると、一覧ページにはそもそもダウンロードリンクが無く、個別ページのリンクはMinitokyo側のバグで壊れていることがあるためです）。
+
+| 引数 | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `image_id` | `int` | 必須 | 画像ID |
+| `referer` | `str` | `"http://www.minitokyo.net/"` | 送信する `Referer` ヘッダー |
+
+**戻り値:** `bytes`（画像の生データ）
+**例外:** `ValueError` — `image_id` が `None`。HTTPエラー時は `requests.exceptions.HTTPError` がそのまま伝播
+
+```python
+data = mt.download_bytes(509290)
+
+with open("509290.jpg", "wb") as f:
+    f.write(data)
+```
+
+`item.download_url` / `item.image` はあくまで「HTMLから拾えた場合のおまけ情報」として扱い、実際にファイルを保存する処理では `download_bytes(item.id)` を使うことを推奨します。
+
+---
+
 ## `Series`
 
 シリーズ（作品）を表すデータクラス。
@@ -237,7 +262,9 @@ item = items[0]
 print(item.download_url)  # item.image と同じ
 ```
 
-> `image` / `thumbnail` / `author` は Minitokyo 側のHTML構造やページ種別によって `None` になることがあります。ダウンロード前に必ず `None` チェックをしてください。
+> ⚠️ **`image` / `download_url` は信頼できないことがあります。** ギャラリー一覧ページ（`ul.scans`）にはそもそも `/downloads/` リンクが含まれていないことが多く、その場合 `image` は `None` になります。また個別ページ（`/view/{id}`）側では、Minitokyo側のサーバーバグで `href` 属性の中にPHPの警告文（`Warning: Undefined array key "filename" in ...`）が混入していることがあり、これは `_clean_url()` で正規表現によりURL部分だけを抽出して対処していますが、根本的にHTML構造に依存する不安定な取得経路です。**実際にファイルをダウンロードする場合は、`item.download_url` の有無に関わらず `Minitokyo.download_bytes(item.id)` を使ってください。** こちらはHTMLをパースせず、Minitokyo自身のダウンロードリダイレクトエンドポイントを直接叩くため安定しています。
+
+> `thumbnail` / `author` についても、Minitokyo 側のHTML構造やページ種別によって `None` になることがあります。使用前に必ず `None` チェックをしてください。
 
 ---
 
@@ -325,17 +352,13 @@ hd_wallpapers = [
 ```python
 item = mt.get(510114)
 
-if item.download_url:
-    res = mt.session.get(
-        item.download_url,
-        headers={"Referer": "http://www.minitokyo.net/"},
-        timeout=20,
-    )
-    res.raise_for_status()
+data = mt.download_bytes(item.id)
 
-    with open(f"{item.id}.jpg", "wb") as f:
-        f.write(res.content)
+with open(f"{item.id}.jpg", "wb") as f:
+    f.write(data)
 ```
+
+> 以前は `item.download_url` を `mt.session.get()` で直接叩く方法を案内していましたが、[前述の通り](#imageitem)このURLはHTMLの構造やサイト側のバグに依存して欠損・破損することがあるため、`mt.download_bytes(item.id)` を使う方法に統一しています。
 
 ### 3. 複数シリーズを横断して壁紙数をまとめる
 
@@ -349,7 +372,9 @@ for name in names:
 
 ### 4. シリーズの画像を全件ダウンロード（カテゴリ絞り込み対応）
 
-`iter_wallpapers()` / `iter_indy_art()` / `iter_scans()` を使って全ページを巡回し、ローカルに保存するヘルパー関数の例です。`categories` 引数でダウンロード対象を絞り込めます。
+`iter_wallpapers()` / `iter_indy_art()` / `iter_scans()` を使って全ページを巡回し、各画像を `mt.download_bytes(item.id)` で取得してローカルに保存するヘルパー関数の例です。`categories` 引数でダウンロード対象を絞り込めます。
+
+`item.download_url`（HTMLからのスクレイピング結果）には依存せず、常に `download_bytes()` でIDから直接取得するため、一覧ページにダウンロードリンクが無いケースや、個別ページのリンクがサイト側のバグで壊れているケースの両方を気にする必要がありません。
 
 ```python
 import time
@@ -358,7 +383,7 @@ from pathlib import Path
 
 import requests
 
-from minitokyo import Minitokyo
+from minitokyo import Minitokyo, MinitokyoError
 
 
 def download_all(
@@ -382,14 +407,13 @@ def download_all(
             else series.iter_scans()
 
         for item in items:
-            url = item.download_url
-            if not url:
-                print(f"[skip] {item.id}: ダウンロードURLなし")
-                continue
-
-            ext = url.rsplit(".", 1)[-1].split("?")[0]
-            if len(ext) > 4 or not ext.isalnum():
-                ext = "jpg"
+            # 拡張子はitem.imageから推測できればそれを使い、
+            # 取れなければjpgにフォールバックする。
+            ext = "jpg"
+            if item.image:
+                guessed = item.image.rsplit(".", 1)[-1].split("?")[0]
+                if len(guessed) <= 4 and guessed.isalnum():
+                    ext = guessed
 
             dest = cat_dir / f"{item.id}.{ext}"
 
@@ -398,18 +422,13 @@ def download_all(
                 continue
 
             try:
-                res = mt.session.get(
-                    url,
-                    headers={"Referer": "http://www.minitokyo.net/"},
-                    timeout=20,
-                )
-                res.raise_for_status()
+                data = mt.download_bytes(item.id)
 
-            except requests.RequestException as e:
+            except (requests.RequestException, MinitokyoError) as e:
                 print(f"[error] {item.id}: {e}")
                 continue
 
-            dest.write_bytes(res.content)
+            dest.write_bytes(data)
             print(f"[ok] {item.id} -> {dest}")
 
             time.sleep(delay)  # サイトに負荷をかけすぎないよう間隔をあける
@@ -458,7 +477,8 @@ python download.py haruhi wallpaper indy_art
 ## 注意点・既知の制約
 
 - **非公式ラッパーです。** Minitokyo公式のAPIではなく、HTML構造をスクレイピング・解析しているため、サイト側のマークアップ変更で動作しなくなる可能性があります。
-- **ホットリンク対策の可能性。** 画像本体（`item.image` / `item.download_url`）に直接アクセスする際、`Referer` ヘッダーや `mt.session` のCookieが必要になる場合があります。403が返る場合はまずここを疑ってください。
+- **`item.image` / `item.download_url` は当てにしないこと。** ギャラリー一覧ページには`/downloads/`リンクがそもそも含まれておらず、`image`が`None`になることがあります。個別ページ（`/view/{id}`）側では、Minitokyo側のサーバーバグにより`href`属性の中にPHPの警告文（`Warning: Undefined array key "filename" in /var/www/minitokyo/www/html2/view.html on line 37`）がそのまま出力されているケースが確認されています。`_clean_url()`は正規表現で実際のURL部分だけを抽出することでこれに対処していますが、根本的にHTML依存で不安定なため、**実ファイルの取得には必ず `Minitokyo.download_bytes(image_id)` を使ってください。**
+- **ホットリンク対策の可能性。** `download_bytes()`を含め、画像本体に直接アクセスする際は`Referer`ヘッダーや`mt.session`のCookieが必要になる場合があります。403が返る場合はまずここを疑ってください。
 - **カウント値の欠損。** `Series.wallpaper_count` などはページ上の表記（例: `"Wallpapers (1,234)"`）から正規表現で抽出しているため、表記が変わると `None` になります。
 - **`author` の抽出精度。** タイトル文字列末尾の `"... by username"` パターンに依存しているため、投稿者名が付いていない・別形式の場合は `None` になります。
 - **レート制限は未実装。** `iter_*` 系メソッドを使う場合、連続リクエストになるため、必要に応じて `time.sleep()` を挟むなど自前でレート制御してください。

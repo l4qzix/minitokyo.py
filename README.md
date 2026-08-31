@@ -21,7 +21,7 @@ pip install requests beautifulsoup4
 6. [カテゴリ](#カテゴリ)
 7. [例外](#例外)
 8. [イテレータ（全ページ取得）](#イテレータ全ページ取得)
-9. [実践例](#実践例)
+9. [実践例](#実践例)（全件ダウンロードスクリプトを含む）
 10. [注意点・既知の制約](#注意点既知の制約)
 
 ---
@@ -347,6 +347,112 @@ for name in names:
     print(f"{series.name}: 壁紙 {series.wallpaper_count} / スキャン {series.scan_count}")
 ```
 
+### 4. シリーズの画像を全件ダウンロード（カテゴリ絞り込み対応）
+
+`iter_wallpapers()` / `iter_indy_art()` / `iter_scans()` を使って全ページを巡回し、ローカルに保存するヘルパー関数の例です。`categories` 引数でダウンロード対象を絞り込めます。
+
+```python
+import time
+import re
+from pathlib import Path
+
+import requests
+
+from minitokyo import Minitokyo
+
+
+def download_all(
+    series_name: str,
+    out_dir: str = "downloads",
+    categories: tuple[str, ...] = ("wallpaper", "indy_art", "scan"),
+    delay: float = 1.0,
+):
+    mt = Minitokyo()
+    series = mt.search(series_name)
+
+    base_dir = Path(out_dir) / _safe_name(series.name)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    for category in categories:
+        cat_dir = base_dir / category
+        cat_dir.mkdir(exist_ok=True)
+
+        items = series.iter_wallpapers() if category == "wallpaper" \
+            else series.iter_indy_art() if category == "indy_art" \
+            else series.iter_scans()
+
+        for item in items:
+            url = item.download_url
+            if not url:
+                print(f"[skip] {item.id}: ダウンロードURLなし")
+                continue
+
+            ext = url.rsplit(".", 1)[-1].split("?")[0]
+            if len(ext) > 4 or not ext.isalnum():
+                ext = "jpg"
+
+            dest = cat_dir / f"{item.id}.{ext}"
+
+            if dest.exists():
+                print(f"[skip] {item.id}: 既にダウンロード済み")
+                continue
+
+            try:
+                res = mt.session.get(
+                    url,
+                    headers={"Referer": "http://www.minitokyo.net/"},
+                    timeout=20,
+                )
+                res.raise_for_status()
+
+            except requests.RequestException as e:
+                print(f"[error] {item.id}: {e}")
+                continue
+
+            dest.write_bytes(res.content)
+            print(f"[ok] {item.id} -> {dest}")
+
+            time.sleep(delay)  # サイトに負荷をかけすぎないよう間隔をあける
+
+
+def _safe_name(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+```
+
+**カテゴリの絞り込みは `categories` 引数だけで変更できます。**
+
+```python
+# デフォルト：壁紙・同人イラスト・スキャン全部
+download_all("haruhi")
+
+# スキャンだけ
+download_all("haruhi", categories=("scan",))
+
+# 壁紙と同人イラストだけ（スキャン除外）
+download_all("haruhi", categories=("wallpaper", "indy_art"))
+
+# 壁紙だけ
+download_all("haruhi", categories=("wallpaper",))
+```
+
+コマンドライン引数で対話的に切り替えたい場合:
+
+```python
+import sys
+
+if __name__ == "__main__":
+    series_name = sys.argv[1]
+    categories = tuple(sys.argv[2:]) or ("wallpaper", "indy_art", "scan")
+    download_all(series_name, categories=categories)
+```
+
+```bash
+python download.py haruhi scan
+python download.py haruhi wallpaper indy_art
+```
+
+> `download_all()` は既存ファイルがあればスキップするので、途中で中断しても再実行すれば続きから再開できます。`delay` はサイトへの負荷軽減とアクセス制限回避のため、1〜2秒程度を目安にしてください。
+
 ---
 
 ## 注意点・既知の制約
@@ -356,4 +462,4 @@ for name in names:
 - **カウント値の欠損。** `Series.wallpaper_count` などはページ上の表記（例: `"Wallpapers (1,234)"`）から正規表現で抽出しているため、表記が変わると `None` になります。
 - **`author` の抽出精度。** タイトル文字列末尾の `"... by username"` パターンに依存しているため、投稿者名が付いていない・別形式の場合は `None` になります。
 - **レート制限は未実装。** `iter_*` 系メソッドを使う場合、連続リクエストになるため、必要に応じて `time.sleep()` を挟むなど自前でレート制御してください。
-- **HTTP接続。** `BASE_URL` / `GALLERY_URL` / `BROWSE_URL` はいずれも `http://` です。サイト側が `https` にリダイレクトする場合、`requests` が自動的に追従します。# minitokyo.py
+- **HTTP接続。** `BASE_URL` / `GALLERY_URL` / `BROWSE_URL` はいずれも `http://` です。サイト側が `https` にリダイレクトする場合、`requests` が自動的に追従します。

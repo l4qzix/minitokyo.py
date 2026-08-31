@@ -92,7 +92,19 @@ class ImageItem:
 
     @property
     def download_url(self) -> Optional[str]:
-        """Alias for the original image URL."""
+        """Alias for the original image URL.
+
+        NOTE: On some pages Minitokyo does not expose a scrapeable
+        /downloads/ link at all (gallery listing pages), or the link
+        is present but corrupted by a server-side PHP warning being
+        injected into the href (individual view pages). In both
+        cases this may be None or unreliable.
+
+        Prefer `Minitokyo.download_bytes(item.id)` when you need a
+        guaranteed way to fetch the original image bytes — it uses
+        Minitokyo's own /download/{id} redirect endpoint instead of
+        parsing HTML.
+        """
         return self.image
 
 
@@ -888,6 +900,15 @@ class Minitokyo:
 
             # ------------------------------------------------
             # Original download URL
+            #
+            # NOTE: gallery listing pages (ul.scans as returned by
+            # /gallery) typically do NOT include a /downloads/ link
+            # at all — that's only present on individual /view/{id}
+            # pages, and even there it can be corrupted by a
+            # server-side PHP warning injected into the href. Don't
+            # rely on this being populated; use
+            # Minitokyo.download_bytes(image_id) instead when you
+            # need the actual file.
             # ------------------------------------------------
 
             image = None
@@ -1074,7 +1095,22 @@ class Minitokyo:
         thumbnail = None
         resolution = None
 
-        # Download link
+        # Download link.
+        #
+        # NOTE: On individual /view/{id} pages, Minitokyo sometimes
+        # injects a PHP warning ("Warning: Undefined array key
+        # \"filename\" in ...") directly into this href, e.g.:
+        #
+        #   <a href="
+        #   Warning: Undefined array key "filename" in ...
+        #   http://static.minitokyo.net/downloads/40/35/509290.jpg"
+        #    onclick="window.location = '/download/509290'; ...">
+        #
+        # _clean_url() below strips that garbage out, but if it
+        # still fails for any reason, fall back to
+        # Minitokyo.download_bytes(image_id), which hits Minitokyo's
+        # own /download/{id} redirect endpoint directly instead of
+        # scraping this link.
         for a in soup.find_all(
             "a",
             href=True
@@ -1168,6 +1204,55 @@ class Minitokyo:
         )
 
     # ========================================================
+    # Download original bytes (robust, does not depend on
+    # scraping a /downloads/ link out of the page HTML)
+    # ========================================================
+
+    def download_bytes(
+        self,
+        image_id: int,
+        referer: str = "http://www.minitokyo.net/",
+    ) -> bytes:
+
+        """
+        Fetch the original image bytes for a given image ID using
+        Minitokyo's own download redirect endpoint:
+
+            http://www.minitokyo.net/download/{id}
+
+        This is the same endpoint the site's own "Download" button
+        uses (see the onclick handler on individual /view/{id}
+        pages: `window.location = '/download/{id}'`). It sidesteps
+        both:
+
+          - gallery listing pages, which usually don't expose a
+            /downloads/ link in their HTML at all, and
+          - individual /view/{id} pages, where the /downloads/ link
+            can be corrupted by a PHP warning Minitokyo sometimes
+            injects into the href.
+
+        Example:
+
+            data = mt.download_bytes(509290)
+            with open("509290.jpg", "wb") as f:
+                f.write(data)
+        """
+
+        if image_id is None:
+            raise ValueError("image_id cannot be None")
+
+        url = f"{BASE_URL}/download/{image_id}"
+
+        response = self._request(
+            "GET",
+            url,
+            headers={"Referer": referer},
+            allow_redirects=True,
+        )
+
+        return response.content
+
+    # ========================================================
     # Category helper
     # ========================================================
 
@@ -1220,6 +1305,25 @@ class Minitokyo:
 
         if match:
             url = match.group(1)
+
+        # Minitokyo sometimes injects a PHP warning directly into
+        # an href attribute, e.g.:
+        #
+        #   "\nWarning: Undefined array key \"filename\" in
+        #    /var/www/minitokyo/www/html2/view.html on line 37
+        #    \nhttp://static.minitokyo.net/downloads/40/35/509290.jpg"
+        #
+        # Extract only the actual http(s) URL portion, ignoring any
+        # surrounding garbage. If more than one URL-looking token is
+        # present, the last one is used (the real link tends to come
+        # after any injected warning text).
+        matches = re.findall(
+            r"https?://\S+",
+            url
+        )
+
+        if matches:
+            url = matches[-1]
 
         # Remove accidental whitespace.
         url = url.strip()
